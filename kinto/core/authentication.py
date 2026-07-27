@@ -1,0 +1,52 @@
+from typing import Any
+
+from pyramid import authentication as base_auth
+from pyramid.config import Configurator
+
+from kinto.core import utils
+from kinto.core.openapi import OpenAPI
+from kinto.core.types import Request
+
+
+class BasicAuthAuthenticationPolicy(base_auth.BasicAuthAuthenticationPolicy):
+    """Basic auth implementation.
+
+    Allow any user with any credentials (e.g. there is no need to create an
+    account).
+
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        def noop_check(*a) -> list:
+            return []
+
+        super().__init__(noop_check, *args, **kwargs)
+
+    def effective_principals(self, request: Request) -> list:
+        # Bypass default Pyramid construction of principals because
+        # Pyramid multiauth already adds userid, Authenticated and Everyone
+        # principals.
+        return []
+
+    def unauthenticated_userid(self, request: Request) -> Any:
+        settings = request.registry.settings
+
+        credentials = base_auth.extract_http_basic_credentials(request)
+        if credentials:
+            username, password = credentials
+            if not username:
+                return
+
+            hmac_secret = settings["userid_hmac_secret"]
+            credentials = f"{credentials[0]}:{credentials[1]}"
+            userid = utils.hmac_digest(hmac_secret, credentials)
+            return userid
+
+
+def includeme(config: Configurator) -> None:
+    config.add_api_capability(
+        "basicauth",
+        description="Very basic authentication sessions. Not for production use.",
+        url="http://kinto.readthedocs.io/en/stable/api/1.x/authentication.html",
+    )
+    OpenAPI.expose_authentication_method("basicauth", {"type": "basic"})

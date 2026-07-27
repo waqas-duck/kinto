@@ -1,0 +1,554 @@
+from unittest import mock
+
+import pytest
+
+from kinto.core import DEFAULT_SETTINGS
+from kinto.core.storage import (
+    MISSING,
+    Filter,
+    Sort,
+    StorageBase,
+    exceptions,
+    generators,
+    memory,
+    postgresql,
+)
+from kinto.core.storage.testing import StorageTest
+from kinto.core.testing import skip_if_no_postgresql, unittest
+from kinto.core.utils import COMPARISON, json
+from kinto.core.utils import sqlalchemy as sa
+
+
+class GeneratorTest(unittest.TestCase):
+    def test_generic_has_mandatory_override(self):
+        self.assertRaises(NotImplementedError, generators.Generator)
+
+    def test_id_generator_must_respect_storage_backends(self):
+        class Dumb(generators.Generator):
+            def __call__(self):
+                return "*" * 80
+
+        self.assertRaises(ValueError, Dumb)
+
+    def test_default_generator_allow_underscores_dash_alphabet(self):
+        class Dumb(generators.Generator):
+            def __call__(self):
+                return "1234"
+
+        generator = Dumb()
+        self.assertTrue(generator.match("1_2_3-abc"))
+        self.assertTrue(generator.match("abc_123"))
+        self.assertFalse(generator.match("-1_2_3-abc"))
+        self.assertFalse(generator.match("_1_2_3-abc"))
+
+    def test_uuid_generator_pattern_allows_uuid_only(self):
+        invalid_uuid = "XXX-00000000-0000-5000-a000-000000000000"
+        generator = generators.UUID4()
+        self.assertFalse(generator.match(invalid_uuid))
+
+    def test_uuid_generator_pattern_is_not_restricted_to_uuid4(self):
+        generator = generators.UUID4()
+        valid_uuid = "fd800e8d-e8e9-3cac-f502-816cbed9bb6c"
+        self.assertTrue(generator.match(valid_uuid))
+        invalid_uuid4 = "00000000-0000-5000-a000-000000000000"
+        self.assertTrue(generator.match(invalid_uuid4))
+        invalid_uuid4 = "00000000-0000-4000-e000-000000000000"
+        self.assertTrue(generator.match(invalid_uuid4))
+
+
+class StorageBaseTest(unittest.TestCase):
+    def setUp(self):
+        self.storage = StorageBase()
+
+    def test_mandatory_overrides(self):
+        calls = [
+            (self.storage.initialize_schema,),
+            (self.storage.flush,),
+            (self.storage.resource_timestamp, "", ""),
+            (self.storage.all_resources_timestamps, ""),
+            (self.storage.create, "", "", {}),
+            (self.storage.get, "", "", ""),
+            (self.storage.update, "", "", "", {}),
+            (self.storage.delete, "", "", ""),
+            (self.storage.delete_all, "", ""),
+            (self.storage.purge_deleted, "", ""),
+            (self.storage.list_all, "", ""),
+            (self.storage.count_all, "", ""),
+            (self.storage.trim_objects, "", "", [], 0),
+        ]
+        for callable_, *args in calls:
+            self.assertRaises(NotImplementedError, callable_, *args)
+
+    def test_backend_error_message_provides_given_message_if_defined(self):
+        error = exceptions.BackendError(message="Connection Error")
+        self.assertEqual(str(error), "Connection Error")
+
+    def test_backenderror_message_default_to_original_exception_message(self):
+        error = exceptions.BackendError(ValueError("Pool Error"))
+        self.assertEqual(str(error), "ValueError: Pool Error")
+
+
+class MemoryBasedStorageTest(unittest.TestCase):
+    def test_backend_raise_not_implemented_error(self):
+        storage = memory.MemoryBasedStorage()
+        with pytest.raises(NotImplementedError):
+            storage.bump_and_store_timestamp("object", "/school/foo/students/bar")
+
+
+class MemoryStorageTest(StorageTest, unittest.TestCase):
+    backend = memory
+
+    def setUp(self):
+        super().setUp()
+        self.client_error_patcher = mock.patch.object(
+            self.storage,
+            "bump_and_store_timestamp",
+            side_effect=exceptions.BackendError("Segmentation fault."),
+        )
+
+    def test_backend_error_provides_original_exception(self):
+        pass
+
+    def test_raises_backend_error_if_error_occurs_on_client(self):
+        pass
+
+    def test_backend_error_is_raised_anywhere(self):
+        pass
+
+    def test_backenderror_message_default_to_original_exception_message(self):
+        pass
+
+    def test_ping_logs_error_if_unavailable(self):
+        pass
+
+    def test_create_bytes_raises(self):
+        data = {"steak": "haché".encode(encoding="utf-8")}
+        self.assertIsInstance(data["steak"], bytes)
+        self.assertRaises(TypeError, self.create_object, data)
+
+    def test_update_bytes_raises(self):
+        obj = self.create_object()
+
+        new_object = {"steak": "haché".encode(encoding="utf-8")}
+        self.assertIsInstance(new_object["steak"], bytes)
+
+        self.assertRaises(
+            TypeError, self.storage.update, object_id=obj["id"], obj=new_object, **self.storage_kw
+        )
+
+
+@pytest.mark.xdist_group("postgres")
+@skip_if_no_postgresql
+class PostgreSQLStorageTest(StorageTest, unittest.TestCase):
+    backend = postgresql
+    settings = {
+        "storage_max_fetch_size": 10000,
+        "storage_backend": "kinto.core.storage.postgresql",
+        "storage_poolclass": "sqlalchemy.pool.StaticPool",
+        "storage_url": "postgresql://postgres:postgres@localhost:5432/testdb",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.client_error_patcher = mock.patch.object(
+            self.storage.client,
+            "session_factory",
+            side_effect=sa.exc.SQLAlchemyError,  # ty: ignore[possibly-missing-submodule]
+        )
+
+    def test_number_of_fetched_objects_can_be_limited_in_settings(self):
+        for i in range(4):
+            self.create_object({"phone": "tel-{}".format(i)})
+
+        results = self.storage.list_all(**self.storage_kw)
+        self.assertEqual(len(results), 4)
+
+        settings = {**self.settings, "storage_max_fetch_size": 2}
+        config = self._get_config(settings=settings)
+        limited = self.backend.load_from_config(config)
+
+        results = limited.list_all(**self.storage_kw)
+        self.assertEqual(len(results), 2)
+        count = limited.count_all(**self.storage_kw)
+        self.assertEqual(count, 4)
+
+    def test_number_of_fetched_objects_is_per_page(self):
+        for i in range(10):
+            self.create_object({"number": i})
+
+        settings = {**self.settings, "storage_max_fetch_size": 2}
+        config = self._get_config(settings=settings)
+        backend = self.backend.load_from_config(config)
+
+        results = backend.list_all(
+            pagination_rules=[[Filter("number", 1, COMPARISON.GT)]], **self.storage_kw
+        )
+        self.assertEqual(len(results), 2)
+        count = backend.count_all(**self.storage_kw)
+        self.assertEqual(count, 10)
+
+    def test_connection_is_rolledback_if_error_occurs(self):
+        with self.storage.client.connect() as conn:
+            query = "DELETE FROM objects WHERE resource_name = 'genre';"
+            conn.execute(sa.text(query))
+
+        try:
+            with self.storage.client.connect() as conn:
+                query = """
+                INSERT INTO objects VALUES ('rock-and-roll', 'music', 'genre', NOW(), '{}', FALSE);
+                """
+                conn.execute(sa.text(query))
+                conn.commit()
+
+                query = """
+                INSERT INTO objects VALUES ('jazz', 'music', 'genre', NOW(), '{}', FALSE);
+                """
+                conn.execute(sa.text(query))
+
+                raise sa.exc.TimeoutError()  # ty: ignore[possibly-missing-submodule]
+        except exceptions.BackendError:
+            pass
+
+        with self.storage.client.connect() as conn:
+            query = "SELECT COUNT(*) FROM objects WHERE resource_name = 'genre';"
+            result = conn.execute(sa.text(query))
+            self.assertEqual(result.fetchone()[0], 1)
+
+    def test_pool_object_is_shared_among_backend_instances(self):
+        config = self._get_config()
+        storage1 = self.backend.load_from_config(config)
+        storage2 = self.backend.load_from_config(config)
+        self.assertEqual(id(storage1.client), id(storage2.client))
+
+    def test_warns_if_configured_pool_size_differs_for_same_backend_type(self):
+        self.backend.load_from_config(self._get_config())
+        settings = {**self.settings, "storage_pool_size": 1}
+        msg = "Reuse existing PostgreSQL connection. Parameters storage_* will be ignored."
+        with mock.patch("kinto.core.storage.postgresql.client.warnings.warn") as mocked:
+            self.backend.load_from_config(self._get_config(settings=settings))
+            mocked.assert_any_call(msg)
+
+    def test_list_all_raises_if_missing_on_strange_query(self):
+        with self.assertRaises(ValueError):
+            self.storage.list_all(
+                "some-resource", "some-parent", filters=[Filter("author", MISSING, COMPARISON.HAS)]
+            )
+
+    def test_integrity_error_rollsback_transaction(self):
+        client = postgresql.create_from_config(
+            self._get_config(), prefix="storage_", with_transaction=False
+        )
+        with self.assertRaises(exceptions.IntegrityError):
+            with client.connect() as conn:
+                # Make some change in a table.
+                conn.execute(
+                    sa.text(
+                        """
+                INSERT INTO objects
+                VALUES ('rock-and-roll', 'music', 'genre', NOW(), '{}', FALSE);
+                """
+                    )
+                )
+                # Go into a failing integrity constraint.
+                query = "INSERT INTO timestamps VALUES ('a', 'b', NOW());"
+                conn.execute(sa.text(query))
+                conn.execute(sa.text(query))
+                conn.commit()
+                conn.close()
+
+        # Check that change in the above table was rolledback.
+        with client.connect() as conn:
+            result = conn.execute(
+                sa.text(
+                    """
+            SELECT FROM objects
+             WHERE parent_id = 'music'
+               AND resource_name = 'genre';
+            """
+                )
+            )
+        self.assertEqual(result.rowcount, 0)
+
+    def test_conflicts_handled_correctly(self):
+        config = self._get_config()
+        storage = self.backend.load_from_config(config)
+        storage.create(resource_name="genre", parent_id="music", obj={"id": "rock-and-roll"})
+
+        def object_not_found(*args, **kwargs):
+            raise exceptions.ObjectNotFoundError()
+
+        with mock.patch.object(storage, "get", side_effect=object_not_found):
+            with self.assertRaises(exceptions.UnicityError):
+                storage.create(
+                    resource_name="genre", parent_id="music", obj={"id": "rock-and-roll"}
+                )
+
+    def test_supports_null_pool(self):
+        settings = {
+            **DEFAULT_SETTINGS,
+            **self.settings,
+            "storage_poolclass": "sqlalchemy.pool.NullPool",
+        }
+        config = self._get_config(settings=settings)
+        self.backend.load_from_config(config)  # does not raise
+
+    def test_pagination_with_modified_field_filter(self):
+        """Functional test: pagination with last_modified filters works correctly."""
+        # Create objects with different timestamps
+        objects = []
+        for i in range(10):
+            obj = self.create_object({"number": i})
+            objects.append(obj)
+
+        # Get objects with pagination using last_modified filter
+        # This simulates what happens during actual pagination
+        before = objects[5]["last_modified"]
+        filters = [Filter("last_modified", before, COMPARISON.LT)]
+
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+
+        # Should get the first 5 objects (created before object #5)
+        self.assertEqual(len(results), 5)
+        for obj in results:
+            self.assertLess(obj["last_modified"], before)
+
+
+class FormatConditionsEQContainmentTest(unittest.TestCase):
+    """Test that _format_conditions uses JSONB containment (@>) for EQ filters
+    on scalar values, enabling GIN index usage."""
+
+    def _get_storage(self):
+        return postgresql.Storage(client=mock.Mock(), max_fetch_size=10000)
+
+    def test_eq_string_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("status", "active", COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"status": "active"})
+
+    def test_eq_integer_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("count", 42, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"count": 42})
+
+    def test_eq_float_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("score", 3.14, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"score": 3.14})
+
+    def test_eq_boolean_uses_containment(self):
+        storage = self._get_storage()
+        for value, field in [(True, "archived"), (False, "active")]:
+            filters = [Filter(field, value, COMPARISON.EQ)]
+            sql, holders = storage._format_conditions(filters, "id", "last_modified")
+            self.assertIn("data @>", sql, f"Failed for {value}")
+            holder_value = holders["filters_value_0"]
+            self.assertEqual(json.loads(holder_value), {field: value})
+
+    def test_eq_none_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("deleted_at", None, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"deleted_at": None})
+
+    def test_eq_nested_field_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("person.name", "Alice", COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"person": {"name": "Alice"}})
+
+    def test_eq_deeply_nested_field_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("a.b.c", "x", COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"a": {"b": {"c": "x"}}})
+
+    def test_eq_empty_string_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("phone", "", COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"phone": ""})
+
+    def test_eq_zero_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("count", 0, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"count": 0})
+
+    def test_eq_array_value_does_not_use_containment(self):
+        """Arrays must use exact equality, not containment (superset match)."""
+        storage = self._get_storage()
+        filters = [Filter("tags", ["red", "blue"], COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+        self.assertIn("=", sql)
+
+    def test_eq_object_value_does_not_use_containment(self):
+        """Objects must use exact equality, not containment (superset match)."""
+        storage = self._get_storage()
+        filters = [Filter("metadata", {"key": "val"}, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+        self.assertIn("=", sql)
+
+    def test_eq_empty_array_does_not_use_containment(self):
+        """Empty array EQ must use exact match, not containment."""
+        storage = self._get_storage()
+        filters = [Filter("orders", [], COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+
+    def test_eq_empty_object_does_not_use_containment(self):
+        """Empty object EQ must use exact match, not containment."""
+        storage = self._get_storage()
+        filters = [Filter("attributes", {}, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+
+    def test_non_eq_operators_do_not_use_containment(self):
+        """GT, LT, NOT, etc. should not use containment."""
+        storage = self._get_storage()
+        for op in (COMPARISON.GT, COMPARISON.LT, COMPARISON.NOT, COMPARISON.MIN, COMPARISON.MAX):
+            filters = [Filter("count", 10, op)]
+            sql, holders = storage._format_conditions(filters, "id", "last_modified")
+            self.assertNotIn("data @>", sql, f"Operator {op} should not use containment")
+
+    def test_eq_on_id_field_does_not_use_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("id", "abc", COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+
+    def test_eq_on_modified_field_does_not_use_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("last_modified", 1234567890, COMPARISON.EQ)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+
+
+class FormatConditionsContainsContainmentTest(unittest.TestCase):
+    """Test that _format_conditions uses top-level JSONB containment (@>) for
+    CONTAINS filters on data fields, enabling GIN index usage."""
+
+    def _get_storage(self):
+        return postgresql.Storage(client=mock.Mock(), max_fetch_size=10000)
+
+    def test_contains_uses_top_level_containment(self):
+        """CONTAINS on data fields should use top-level data @> for GIN."""
+        storage = self._get_storage()
+        filters = [Filter("colors", ["red"], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"colors": ["red"]})
+
+    def test_contains_nested_field_uses_top_level_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("meta.tags", ["important"], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"meta": {"tags": ["important"]}})
+
+    def test_contains_multiple_values_uses_top_level_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("colors", ["red", "blue"], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"colors": ["red", "blue"]})
+
+    def test_contains_with_numeric_array_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("fib", [2, 3], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"fib": [2, 3]})
+
+    def test_contains_with_object_elements_uses_containment(self):
+        storage = self._get_storage()
+        filters = [Filter("items", [{"id": 1}], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertIn("data @>", sql)
+        value = holders["filters_value_0"]
+        self.assertEqual(json.loads(value), {"items": [{"id": 1}]})
+
+    def test_contains_any_does_not_use_containment(self):
+        """CONTAINS_ANY uses && operator which cannot use GIN."""
+        storage = self._get_storage()
+        filters = [Filter("colors", ["red"], COMPARISON.CONTAINS_ANY)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+        self.assertIn("&&", sql)
+
+    def test_contains_on_id_field_falls_back_to_subexpression(self):
+        """CONTAINS on id/modified fields uses the old sub-expression path."""
+        storage = self._get_storage()
+        filters = [Filter("id", ["a"], COMPARISON.CONTAINS)]
+        sql, holders = storage._format_conditions(filters, "id", "last_modified")
+        self.assertNotIn("data @>", sql)
+
+
+class FormatSortingNormalizationTest(unittest.TestCase):
+    """Test that _format_sorting uses the same JSONB accessor expression format
+    as _format_conditions (without parentheses around placeholders)."""
+
+    def _get_storage(self):
+        return postgresql.Storage(client=mock.Mock(), max_fetch_size=10000)
+
+    def test_sorting_uses_arrow_without_parentheses(self):
+        storage = self._get_storage()
+        sorting = [Sort("status", 1)]
+        sql, holders = storage._format_sorting(sorting, "id", "last_modified")
+        self.assertIn("->:sort_field_0_0", sql)
+        self.assertNotIn("->(:", sql)
+        self.assertEqual(holders["sort_field_0_0"], "status")
+
+    def test_sorting_nested_field_uses_arrow_without_parentheses(self):
+        storage = self._get_storage()
+        sorting = [Sort("person.name", 1)]
+        sql, holders = storage._format_sorting(sorting, "id", "last_modified")
+        self.assertIn("->:sort_field_0_0->:sort_field_0_1", sql)
+        self.assertNotIn("->(:", sql)
+        self.assertEqual(holders["sort_field_0_0"], "person")
+        self.assertEqual(holders["sort_field_0_1"], "name")
+
+    def test_sorting_format_matches_conditions_format(self):
+        """The JSONB accessor expression in sorting should use the same format
+        as in conditions, so expression indexes can be shared."""
+        storage = self._get_storage()
+
+        # Get expression format from _format_conditions (non-LIKE, non-EQ-scalar
+        # to force arrow path — use GT which always uses arrows)
+        filters = [Filter("status", 10, COMPARISON.GT)]
+        cond_sql, cond_holders = storage._format_conditions(filters, "id", "last_modified")
+
+        # Get expression format from _format_sorting
+        sorting = [Sort("status", 1)]
+        sort_sql, sort_holders = storage._format_sorting(sorting, "id", "last_modified")
+
+        # Extract the data accessor pattern from each
+        # conditions: data->:filters_field_0_0
+        # sorting: data->:sort_field_0_0
+        # The format should be the same: data->:<placeholder>
+        self.assertIn("data->:", cond_sql)
+        self.assertIn("data->:", sort_sql)

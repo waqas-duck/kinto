@@ -1,0 +1,162 @@
+"""
+A helper class to run migrations using a series of SQL files.
+"""
+
+import logging
+import os
+from typing import Any
+
+from zope.interface import implementer
+
+from kinto.core.migrations import IMigratable
+from kinto.core.utils import sqlalchemy as sa
+
+
+logger = logging.getLogger(__name__)
+
+
+class MigratorMixin:
+    """Mixin to allow the running of migrations.
+
+    Your class must provide a `client` attribute (a PostgreSQLClient),
+    as well as override some class attributes.
+    """
+
+    """Name of this migrator (e.g. "storage"). Override this."""
+    name = None
+    client: Any  # Provided by the concrete class that mixes this in.
+
+    """The current "newest" schema version. Override this."""
+    schema_version: Any = None
+
+    """The file to find the current "newest" schema in. Override this."""
+    schema_file: Any = None
+
+    """The directory to find migration files in.
+
+    Migrations should each be a file named migration_nnn_mmm.sql, where mmm = nnn + 1.
+    """
+    migrations_directory: Any = None
+
+    def get_installed_version(self) -> int | None:
+        """Return current version of schema or None if none found.
+
+        Override this.
+
+        This may be called several times during a single migration.
+        """
+        raise NotImplementedError("method not overridden")  # pragma: no cover
+
+    def create_or_migrate_schema(self, dry_run: bool = False) -> None:
+        """Either create or migrate the schema, as needed."""
+        version = self.get_installed_version()
+        if not version:
+            self.create_schema(dry_run)
+            return
+
+        logger.info(f"Detected PostgreSQL {self.name} schema version {version}.")
+        if version == self.schema_version:
+            logger.info(f"PostgreSQL {self.name} schema is up-to-date.")
+            return
+
+        self.migrate_schema(version, dry_run)
+
+    def create_schema(self, dry_run: bool) -> None:
+        """Actually create the schema from scratch using self.schema_file.
+
+        You can override this if you want to add additional sanity checks.
+        """
+        logger.info(
+            f"Create PostgreSQL {self.name} schema at version {self.schema_version} from {self.schema_file}."
+        )
+        if not dry_run:
+            self._execute_sql_file(self.schema_file)
+            logger.info(f"Created PostgreSQL {self.name} schema (version {self.schema_version}).")
+
+    def migrate_schema(self, start_version: int, dry_run: bool) -> None:
+        migrations = [(v, v + 1) for v in range(start_version, self.schema_version)]
+        for migration in migrations:
+            expected = migration[0]
+            current = self.get_installed_version()
+            error_msg = f"PostgreSQL {self.name} schema: Expected version {expected}. Found version {current}."
+            if not dry_run and expected != current:
+                raise AssertionError(error_msg)
+
+            logger.info(
+                f"Migrate PostgreSQL {self.name} schema from version {migration[0]} to {migration[1]}."
+            )
+            filename = "migration_{0:03d}_{1:03d}.sql".format(*migration)
+            filepath = os.path.join(self.migrations_directory, filename)
+            logger.info(f"Execute PostgreSQL {self.name} migration from {filepath}")
+            if not dry_run:
+                self._execute_sql_file(filepath)
+        logger.info(
+            f"PostgreSQL {self.name} schema migration {'simulated' if dry_run else 'done'}"
+        )
+
+    def _execute_sql_file(self, filepath: str) -> None:
+        """Helper method to execute the SQL in a file."""
+        with open(filepath) as f:
+            schema = f.read()
+        # Since called outside request, force commit.
+        with self.client.connect(force_commit=True) as conn:
+            conn.execute(sa.text(schema))
+
+
+@implementer(IMigratable)
+class PostgreSQLPluginMigration(MigratorMixin):
+    """Base class for plugin storage migrations on PostgreSQL.
+
+    Inherits all migration logic from :class:`MigratorMixin` — the same
+    engine used by Kinto's own storage and permission backends.
+
+    Subclass and set ``name``, ``schema_version``.
+
+    Then choose between:
+    - inline SQL by overriding `migrate_schema(start_version, dry_run)`
+    - file based by setting the ``migrations_directory`` class attribute, pointing
+      at the directory containing the migration files. Migration SQL files must
+      be named ``migration_NNN_MMM.sql`` where ``MMM = NNN + 1``.
+
+    In both cases, the migration should end by inserting the new version into the ``metadata`` table,
+    with a name of ``{name}_schema_version``::
+
+        INSERT INTO metadata (name, value)
+          VALUES ('myplugin_schema_version', '{to_version}');
+
+    Then register in ``includeme()``::
+
+        config.add_migration("myplugin", MyPluginMigration())
+
+    ``kinto migrate`` injects the PostgreSQL client automatically and skips
+    the migration when the storage backend is not PostgreSQL.
+    """
+
+    def initialize_schema(self, client, dry_run: bool = False) -> None:
+        """
+        Main entry point of `IMigratable` interface.
+
+        This leverages the `MigratorMixin` logic, which will call `get_installed_version()`.
+        Since `get_installed_version()` returns `1` when no version is found,
+        the `create_schema()` method of the mixin will never be called in plugin migrations.
+        """
+        self.client = client
+        return self.create_or_migrate_schema(dry_run)
+
+    def get_installed_version(self) -> int:
+        # Get highest version for this plugin, or always return 1
+        # if no version found.
+        query = """
+        SELECT value AS version
+          FROM metadata
+         WHERE name = :key
+         ORDER BY LPAD(value, 3, '0') DESC
+         LIMIT 1;
+        """
+        with self.client.connect() as conn:
+            result = conn.execute(
+                sa.text(query),
+                {"key": f"{self.name}_schema_version"},
+            )
+            row = result.fetchone()
+        return int(row.version) if row is not None else 1

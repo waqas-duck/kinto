@@ -1,0 +1,196 @@
+[project]
+dynamic = ["version", "readme"]
+name = "kinto"
+description = "Kinto Web Service - Store, Sync, Share, and Self-Host."
+license = {file = "LICENSE"}
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+    "License :: OSI Approved :: Apache Software License",
+]
+keywords = ["web", "sync", "json", "storage", "services"]
+authors = [
+  {name = "Mozilla Services", email = "developers@kinto-storage.org"},
+]
+dependencies = [
+    "bcrypt",
+    "colander",
+    "dockerflow",
+    "jsonschema",
+    "jsonpatch",
+    "logging-color-formatter",
+    "python-dateutil",
+    "pyramid",
+    "pyramid_multiauth>=1.1.0",
+    "transaction",
+    "pyramid_tm",
+    "requests",
+    "waitress",
+    "python-rapidjson",
+    # pyramid still requires setuptools<82.0
+    "setuptools<82.0",
+    "pyjwt[crypto]>=2.13.0",
+]
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/Kinto/kinto"
+
+[project.scripts]
+kinto = "kinto.__main__:main"
+
+[project.entry-points."paste.app_factory"]
+main = "kinto:main"
+
+[tool.setuptools.packages.find]
+include = ["kinto*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.tpl", "*.sql", "*.json", "plugins/admin/build/**", "VERSION"]
+
+[tool.setuptools.dynamic]
+readme = {file = ["README.rst", "CONTRIBUTORS.rst"]}
+
+[tool.setuptools_scm]
+# can be empty if no extra settings are needed, presence enables setuptools_scm
+
+[build-system]
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "docstring-format-checker>=1.11.4",
+    "pytest-xdist>=3.8.0",
+    "ty>=0.0.19",
+]
+
+[project.optional-dependencies]
+memcached = [
+    "python-memcached",
+]
+redis = [
+    "redis",
+]
+postgresql = [
+    "SQLAlchemy < 3",
+    "psycopg2-binary",
+    "zope.sqlalchemy",
+]
+monitoring = [
+    "newrelic",
+    "sentry-sdk[sqlalchemy]",
+    "statsd",
+    "werkzeug",
+    "prometheus-client",
+]
+test = [
+    "bravado",
+    "flex",
+    "pytest",
+    "pytest-cache",
+    "pytest-cov",
+    "playwright",
+    "webtest",
+]
+dev = [
+    "build",
+    "ruff",
+    "twine",
+    "granian",
+]
+container = [
+    "kinto-attachment",
+    "kinto-emailer",
+    "httpie",
+]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.0"
+pattern = "default-unprefixed"
+
+[tool.pytest.ini_options]
+addopts = "-n auto --dist=loadgroup"
+testpaths = ["tests"]
+markers = [
+    "xdist_group: mark tests to run in the same xdist worker group",
+]
+filterwarnings = [
+    # Hide warnings about our own code.
+    "ignore:No value specified for `settings_prefix`:UserWarning",
+    "ignore:HTTPS is not enabled:UserWarning",
+    "ignore:Reuse existing PostgreSQL connection:UserWarning",
+    # Pyramid uses pkg_resources internally
+    # See https://github.com/Pylons/pyramid/issues/3731
+    "ignore:pkg_resources is deprecated as an API:UserWarning:pyramid",
+    # pkg_resources namespace packages
+    "ignore:Deprecated call to `pkg_resources.declare_namespace:DeprecationWarning:pkg_resources",
+    # bravado
+    "ignore:jsonschema.RefResolver is deprecated:DeprecationWarning:bravado_core",
+    "ignore:jsonschema.RefResolver.in_scope is deprecated:DeprecationWarning:bravado_core",
+    # swagger
+    "ignore:jsonschema.RefResolver is deprecated:DeprecationWarning:swagger_spec_validator",
+    # webob
+    "ignore:datetime.datetime.utcnow.. is deprecated:DeprecationWarning:webob",
+    "ignore:'cgi' is deprecated and slated for removal:DeprecationWarning:webob",
+]
+
+[tool.coverage.run]
+branch = true
+omit = [
+    "kinto/core/cornice/*",
+    "kinto/core/cornice_swagger/*",
+]
+
+[tool.ruff]
+line-length = 99
+extend-exclude = [
+    "__pycache__",
+    ".venv/",
+    "kinto/plugins/admin/node_modules/",
+]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E", "W",
+    # flake8
+    "F",
+    # isort
+    "I",
+]
+ignore = [
+    # `format` will wrap lines.
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+
+[tool.docstring-format-checker]
+require_docstrings = false
+sections = [
+    { name = "summary", type = "free_text", required = false },
+    { name = "params", type = "list_name_and_type", required = false },
+]
+
+[tool.typos.default]
+extend-ignore-re = [
+    # Ignore blocks between `# spellchecker:off` and `# spellchecker:on`
+    "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on",
+]
+
+[tool.typos.default.extend-words]
+# MoFo
+Fo = "Fo"
+gti = "gti"
